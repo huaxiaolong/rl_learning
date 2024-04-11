@@ -1,132 +1,316 @@
-import gym
-import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import rl_utils
 
-
-class PolicyNet(torch.nn.Module):
+class ActorSoftmax(nn.Module):
     """策略网络"""
-    def __init__(self, state_dim, hidden_dim, action_dim):
-        super(PolicyNet, self).__init__()
-        self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
-        self.fc2 = torch.nn.Linear(hidden_dim, action_dim)
-
-    def forward(self, x):
+    def __init__(self, input_dim, output_dim, hidden_dim=256):
+        super(ActorSoftmax, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+    def forward(self,x):
         x = F.relu(self.fc1(x))
-        return F.softmax(self.fc2(x), dim=1)
-
-
-class ValueNet(torch.nn.Module):
+        x = F.relu(self.fc2(x))
+        probs = F.softmax(self.fc3(x),dim=1)
+        return probs
+class Critic(nn.Module):
     """价值网络"""
-    def __init__(self, state_dim, hidden_dim):
-        super(ValueNet, self).__init__()
-        self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
-        self.fc2 = torch.nn.Linear(hidden_dim, 1)
-
-    def forward(self, x):
+    def __init__(self,input_dim,output_dim,hidden_dim=256):
+        super(Critic,self).__init__()
+        assert output_dim == 1 # critic must output a single value
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+    def forward(self,x):
         x = F.relu(self.fc1(x))
-        return self.fc2(x)
+        x = F.relu(self.fc2(x))
+        value = self.fc3(x)
+        return value
+    
+import random
+from collections import deque
+class ReplayBufferQue:
+    '''DQN的经验回放池，每次采样batch_size个样本'''
+    def __init__(self, capacity: int) -> None:
+        self.capacity = capacity
+        self.buffer = deque(maxlen=self.capacity)
+    def push(self,transitions):
+        '''_summary_
+        Args:
+            trainsitions (tuple): _description_
+        '''
+        self.buffer.append(transitions)
+    def sample(self, batch_size: int, sequential: bool = False):
+        if batch_size > len(self.buffer):
+            batch_size = len(self.buffer)
+        if sequential: # sequential sampling
+            rand = random.randint(0, len(self.buffer) - batch_size)
+            batch = [self.buffer[i] for i in range(rand, rand + batch_size)]
+            return zip(*batch)
+        else:
+            batch = random.sample(self.buffer, batch_size)
+            return zip(*batch)
+    def clear(self):
+        self.buffer.clear()
+    def __len__(self):
+        return len(self.buffer)
 
+class PGReplay(ReplayBufferQue):
+    '''PG的经验回放池，每次采样所有样本，因此只需要继承ReplayBufferQue，重写sample方法即可
+    '''
+    def __init__(self):
+        self.buffer = deque()
+    def sample(self):
+        ''' sample all the transitions
+        '''
+        batch = list(self.buffer)
+        return zip(*batch)
+    
+import torch
+from torch.distributions import Categorical
+class Agent:
+    def __init__(self,cfg) -> None:
+        
+        self.gamma = cfg.gamma
+        self.device = torch.device(cfg.device) 
+        self.actor = ActorSoftmax(cfg.n_states,cfg.n_actions, hidden_dim = cfg.actor_hidden_dim).to(self.device)
+        self.critic = Critic(cfg.n_states,1,hidden_dim=cfg.critic_hidden_dim).to(self.device)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=cfg.actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
+        self.memory = PGReplay()
+        self.k_epochs = cfg.k_epochs # update policy for K epochs
+        self.eps_clip = cfg.eps_clip # clip parameter for PPO
+        self.entropy_coef = cfg.entropy_coef # entropy coefficient
+        self.sample_count = 0
+        self.update_freq = cfg.update_freq
 
-class PPO:
-    ''' PPO算法,采用截断方式 '''
-    def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
-                 lmbda, epochs, eps, gamma, device):
-        self.actor = PolicyNet(state_dim, hidden_dim, action_dim).to(device)
-        self.critic = ValueNet(state_dim, hidden_dim).to(device)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
-                                                lr=actor_lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
-                                                 lr=critic_lr)
-        self.gamma = gamma
-        self.lmbda = lmbda
-        self.epochs = epochs  # 一条序列的数据用来训练轮数
-        self.eps = eps  # PPO中截断范围的参数
-        self.device = device
-
-    def take_action(self, state):
-        state = torch.tensor([state], dtype=torch.float).to(self.device)
+    def sample_action(self,state):
+        self.sample_count += 1
+        state = torch.tensor(state, device=self.device, dtype=torch.float32).unsqueeze(dim=0)
         probs = self.actor(state)
-        action_dist = torch.distributions.Categorical(probs)
-        action = action_dist.sample()
-        return action.item()
-
-    def update(self, transition_dict):
-        states = torch.tensor(transition_dict['states'],
-                              dtype=torch.float).to(self.device)
-        actions = torch.tensor(transition_dict['actions']).view(-1, 1).to(
-            self.device)
-        rewards = torch.tensor(transition_dict['rewards'],
-                               dtype=torch.float).view(-1, 1).to(self.device)
-        next_states = torch.tensor(transition_dict['next_states'],
-                                   dtype=torch.float).to(self.device)
-        dones = torch.tensor(transition_dict['dones'],
-                             dtype=torch.float).view(-1, 1).to(self.device)
-        # 时序差分残差目标
-        # Q动作价值
-        td_target = rewards + self.gamma * self.critic(next_states) * (1 -
-                                                                       dones)
-        # 残差值
-        td_delta = td_target - self.critic(states)
-        # 优势值
-        advantage = rl_utils.compute_advantage(self.gamma, self.lmbda,
-                                               td_delta.cpu()).to(self.device)
-        old_log_probs = torch.log(self.actor(states).gather(1,
-                                                            actions)).detach()
-
-        for _ in range(self.epochs):
-            log_probs = torch.log(self.actor(states).gather(1, actions))
-            # 两个行为的比值，用指数函数，使数值稳定
-            ratio = torch.exp(log_probs - old_log_probs)
+        dist = Categorical(probs)
+        action = dist.sample()
+        self.log_probs = dist.log_prob(action).detach()
+        return action.detach().cpu().numpy().item()
+    @torch.no_grad()
+    def predict_action(self,state):
+        state = torch.tensor(state, device=self.device, dtype=torch.float32).unsqueeze(dim=0)
+        probs = self.actor(state)
+        dist = Categorical(probs)
+        action = dist.sample()
+        return action.detach().cpu().numpy().item()
+    def update(self):
+        # update policy every n steps
+        if self.sample_count % self.update_freq != 0:
+            return
+        # print("update policy")
+        old_states, old_actions, old_log_probs, old_rewards, old_dones = self.memory.sample()
+        # convert to tensor
+        old_states = torch.tensor(np.array(old_states), device=self.device, dtype=torch.float32)
+        old_actions = torch.tensor(np.array(old_actions), device=self.device, dtype=torch.float32)
+        old_log_probs = torch.tensor(old_log_probs, device=self.device, dtype=torch.float32)
+        # monte carlo estimate of state rewards
+        returns = []
+        discounted_sum = 0
+        for reward, done in zip(reversed(old_rewards), reversed(old_dones)):
+            if done:
+                discounted_sum = 0
+            discounted_sum = reward + (self.gamma * discounted_sum)
+            returns.insert(0, discounted_sum)
+        # Normalizing the rewards:
+        returns = torch.tensor(returns, device=self.device, dtype=torch.float32)
+        returns = (returns - returns.mean()) / (returns.std() + 1e-5) # 1e-5 to avoid division by zero
+        for _ in range(self.k_epochs):
+            # compute advantage
+            values = self.critic(old_states) # detach to avoid backprop through the critic
+            advantage = returns - values.detach()
+            # get action probabilities
+            probs = self.actor(old_states)
+            dist = Categorical(probs)
+            # get new action probabilities
+            new_probs = dist.log_prob(old_actions)
+            # compute ratio (pi_theta / pi_theta__old):
+            # 使用指数使数值稳定
+            ratio = torch.exp(new_probs - old_log_probs) # old_log_probs must be detached
+            # compute surrogate loss
             surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.eps,
-                                1 + self.eps) * advantage  # 截断
-            # 策略损失，目标是最大化奖励，所以损失需要取负
-            actor_loss = torch.mean(-torch.min(surr1, surr2))  # PPO损失函数
-            # 价值损失，衡量行为好坏
-            critic_loss = torch.mean(
-                F.mse_loss(self.critic(states), td_target.detach()))
+            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantage
+            # compute actor loss
+            '''
+            在强化学习中，熵在训练中被引入是为了促进策略的探索。熵越大，表示策略的不确定性越高，即在选择动作时策略更加随机。通过增加熵的奖励项到损失函数中，可以使得策略更倾向于探索未知的动作空间，而不是仅仅依赖于当前已知的最优策略。
+            在 Proximal Policy Optimization（PPO）算法中，加入熵的奖励项有助于平衡探索和利用之间的权衡。在计算 Actor Loss 时，通过乘以一个超参数 self.entropy_coef，对熵的影响进行调节，这个超参数通常是在训练过程中手动调节的。
+            总的来说，将熵的加权值添加到损失函数中，可以使得训练的策略更加多样化和灵活，从而有助于避免陷入局部最优解，并提高算法的稳定性和收敛速度。
+            '''
+            actor_loss = -torch.min(surr1, surr2).mean() + self.entropy_coef * dist.entropy().mean()
+            # compute critic loss(mean squre error)
+            # 用于衡量行为好坏
+            critic_loss = (returns - values).pow(2).mean()
+            # take gradient step
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
             actor_loss.backward()
             critic_loss.backward()
             self.actor_optimizer.step()
             self.critic_optimizer.step()
+        self.memory.clear()
 
-actor_lr = 1e-3
-critic_lr = 1e-2
-num_episodes = 500
-hidden_dim = 128
-gamma = 0.98
-lmbda = 0.95
-epochs = 10
-eps = 0.2
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device(
-    "cpu")
+import copy
+def train(cfg, env, agent):
+    ''' 训练
+    '''
+    print("开始训练！")
+    rewards = []  # 记录所有回合的奖励
+    steps = []
+    best_ep_reward = 0 # 记录最大回合奖励
+    output_agent = None
+    for i_ep in range(cfg.train_eps):
+        ep_reward = 0  # 记录一回合内的奖励
+        ep_step = 0
+        state = env.reset()  # 重置环境，返回初始状态
+        for _ in range(cfg.max_steps):
+            ep_step += 1
+            action = agent.sample_action(state)  # 选择动作
+            next_state, reward, done, _ = env.step(action)  # 更新环境，返回transition
+            agent.memory.push((state, action,agent.log_probs,reward,done))  # 保存transition
+            state = next_state  # 更新下一个状态
+            agent.update()  # 更新智能体
+            ep_reward += reward  # 累加奖励
+            if done:
+                break
+        if (i_ep+1)%cfg.eval_per_episode == 0:
+            sum_eval_reward = 0
+            for _ in range(cfg.eval_eps):
+                eval_ep_reward = 0
+                state = env.reset()
+                for _ in range(cfg.max_steps):
+                    action = agent.predict_action(state)  # 选择动作
+                    next_state, reward, done, _ = env.step(action)  # 更新环境，返回transition
+                    state = next_state  # 更新下一个状态
+                    eval_ep_reward += reward  # 累加奖励
+                    if done:
+                        break
+                sum_eval_reward += eval_ep_reward
+            mean_eval_reward = sum_eval_reward/cfg.eval_eps
+            if mean_eval_reward >= best_ep_reward:
+                best_ep_reward = mean_eval_reward
+                output_agent = copy.deepcopy(agent)
+                print(f"回合：{i_ep+1}/{cfg.train_eps}，奖励：{ep_reward:.2f}，评估奖励：{mean_eval_reward:.2f}，最佳评估奖励：{best_ep_reward:.2f}，更新模型！")
+            else:
+                print(f"回合：{i_ep+1}/{cfg.train_eps}，奖励：{ep_reward:.2f}，评估奖励：{mean_eval_reward:.2f}，最佳评估奖励：{best_ep_reward:.2f}")
+        steps.append(ep_step)
+        rewards.append(ep_reward)
+    print("完成训练！")
+    env.close()
+    return output_agent,{'rewards':rewards}
 
-env_name = 'CartPole-v0'
-env = gym.make(env_name)
-env.seed(0)
-torch.manual_seed(0)
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.n
-agent = PPO(state_dim, hidden_dim, action_dim, actor_lr, critic_lr, lmbda,
-            epochs, eps, gamma, device)
+def test(cfg, env, agent):
+    print("开始测试！")
+    rewards = []  # 记录所有回合的奖励
+    steps = []
+    for i_ep in range(cfg.test_eps):
+        ep_reward = 0  # 记录一回合内的奖励
+        ep_step = 0
+        state = env.reset()  # 重置环境，返回初始状态
+        for _ in range(cfg.max_steps):
+            ep_step+=1
+            action = agent.predict_action(state)  # 选择动作
+            next_state, reward, done, _ = env.step(action)  # 更新环境，返回transition
+            state = next_state  # 更新下一个状态
+            ep_reward += reward  # 累加奖励
+            if done:
+                break
+        steps.append(ep_step)
+        rewards.append(ep_reward)
+        print(f"回合：{i_ep+1}/{cfg.test_eps}，奖励：{ep_reward:.2f}")
+    print("完成测试")
+    env.close()
+    return {'rewards':rewards}
 
-return_list = rl_utils.train_on_policy_agent(env, agent, num_episodes)
+import gym
+import os
+import numpy as np
+def all_seed(env,seed = 1):
+    ''' 万能的seed函数
+    '''
+    if seed == 0:
+        return
+    env.seed(seed) # env config
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed) # config for CPU
+    torch.cuda.manual_seed(seed) # config for GPU
+    os.environ['PYTHONHASHSEED'] = str(seed) # config for python scripts
+    # config for cudnn
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.enabled = False
+def env_agent_config(cfg):
+    env = gym.make(cfg.env_name) # 创建环境
+    all_seed(env,seed=cfg.seed)
+    n_states = env.observation_space.shape[0]
+    n_actions = env.action_space.n
+    print(f"状态空间维度：{n_states}，动作空间维度：{n_actions}")
+    # 更新n_states和n_actions到cfg参数中
+    setattr(cfg, 'n_states', n_states)
+    setattr(cfg, 'n_actions', n_actions) 
+    agent = Agent(cfg)
+    return env,agent
 
-episodes_list = list(range(len(return_list)))
-plt.plot(episodes_list, return_list)
-plt.xlabel('Episodes')
-plt.ylabel('Returns')
-plt.title('PPO on {}'.format(env_name))
-plt.show()
+import matplotlib.pyplot as plt
+import seaborn as sns
+class Config:
+    def __init__(self) -> None:
+        self.env_name = "CartPole-v0" # 环境名字
+        self.new_step_api = False # 是否用gym的新api
+        self.algo_name = "PPO" # 算法名字
+        self.mode = "train" # train or test
+        self.seed = 1 # 随机种子
+        self.device = "cuda" # device to use
+        self.train_eps = 200 # 训练的回合数
+        self.test_eps = 20 # 测试的回合数
+        self.max_steps = 200 # 每个回合的最大步数
+        self.eval_eps = 5 # 评估的回合数
+        self.eval_per_episode = 10 # 评估的频率
 
-mv_return = rl_utils.moving_average(return_list, 9)
-plt.plot(episodes_list, mv_return)
-plt.xlabel('Episodes')
-plt.ylabel('Returns')
-plt.title('PPO on {}'.format(env_name))
-plt.show()
+        self.gamma = 0.99 # 折扣因子
+        self.k_epochs = 4 # 更新策略网络的次数
+        self.actor_lr = 0.0003 # actor网络的学习率
+        self.critic_lr = 0.0003 # critic网络的学习率
+        self.eps_clip = 0.2 # epsilon-clip
+        self.entropy_coef = 0.01 # entropy的系数
+        self.update_freq = 100 # 更新频率
+        self.actor_hidden_dim = 256 # actor网络的隐藏层维度
+        self.critic_hidden_dim = 256 # critic网络的隐藏层维度
+
+def smooth(data, weight=0.9):  
+    '''用于平滑曲线，类似于Tensorboard中的smooth曲线
+    '''
+    last = data[0] 
+    smoothed = []
+    for point in data:
+        smoothed_val = last * weight + (1 - weight) * point  # 计算平滑值
+        smoothed.append(smoothed_val)                    
+        last = smoothed_val                                
+    return smoothed
+
+def plot_rewards(rewards, cfg, tag='train'):
+    ''' 画图
+    '''
+    plt.figure()  # 创建一个图形实例，方便同时多画几个图
+    plt.title(f"{tag}ing curve on {cfg.device} of {cfg.algo_name} for {cfg.env_name}")
+    plt.xlabel('epsiodes')
+    plt.plot(rewards, label='rewards')
+    plt.plot(smooth(rewards), label='smoothed')
+    plt.legend()
+    plt.show()
+
+# 获取参数
+cfg = Config() 
+# 训练
+env, agent = env_agent_config(cfg)
+best_agent,res_dic = train(cfg, env, agent)
+ 
+plot_rewards(res_dic['rewards'], cfg, tag="train")  
+# 测试
+res_dic = test(cfg, env, best_agent)
+plot_rewards(res_dic['rewards'], cfg, tag="test")  # 画出结果
